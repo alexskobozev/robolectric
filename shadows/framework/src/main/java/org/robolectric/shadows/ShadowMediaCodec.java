@@ -11,12 +11,16 @@ import android.annotation.NonNull;
 import android.annotation.Nullable;
 import android.media.MediaCodec;
 import android.media.MediaCodec.BufferInfo;
+import android.media.MediaCodec.CodecException;
 import android.media.MediaCrypto;
 import android.media.MediaFormat;
 import android.view.Surface;
+import java.lang.reflect.Constructor;
+import java.lang.reflect.InvocationTargetException;
 import java.nio.Buffer;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
+import java.util.Arrays;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.concurrent.BlockingQueue;
@@ -89,6 +93,7 @@ public class ShadowMediaCodec {
   @Nullable private MediaFormat pendingOutputFormat;
 
   private final BlockingQueue<Integer> inputBufferAvailableIndexes = new LinkedBlockingDeque<>();
+  private final boolean[] inputBuffersOwned = new boolean[BUFFER_COUNT];
   private final BlockingQueue<Integer> outputBufferAvailableIndexes = new LinkedBlockingDeque<>();
 
   private final ByteBuffer[] inputBuffers = new ByteBuffer[BUFFER_COUNT];
@@ -121,6 +126,7 @@ public class ShadowMediaCodec {
           ByteBuffer.allocateDirect(codecConfig.outputBufferSize).order(ByteOrder.LITTLE_ENDIAN);
       outputBufferInfos[i] = new BufferInfo();
       inputBufferAvailableIndexes.add(i);
+      inputBuffersOwned[i] = true;
     }
   }
 
@@ -163,6 +169,7 @@ public class ShadowMediaCodec {
     outputBufferAvailableIndexes.clear();
     for (int i = 0; i < BUFFER_COUNT; i++) {
       inputBufferAvailableIndexes.add(i);
+      inputBuffersOwned[i] = true;
     }
 
     if (isAsync) {
@@ -184,6 +191,9 @@ public class ShadowMediaCodec {
   /** Flushes the available output buffers. */
   @Implementation(minSdk = LOLLIPOP)
   protected void native_flush() {
+    // Input buffers are now owned by the codec.
+    Arrays.fill(inputBuffersOwned, true);
+
     // Reset input buffers only if the MediaCodec is in synchronous mode. If it is in asynchronous
     // mode, the client needs to call start().
     if (!isAsync) {
@@ -206,8 +216,9 @@ public class ShadowMediaCodec {
   @Implementation(minSdk = LOLLIPOP)
   protected ByteBuffer getBuffer(boolean input, int index) {
     ByteBuffer[] buffers = input ? inputBuffers : outputBuffers;
-
-    return (index >= 0 && index < buffers.length) ? buffers[index] : null;
+    return index >= 0 && index < buffers.length && !(input && inputBuffersOwned[index])
+        ? buffers[index]
+        : null;
   }
 
   protected int native_dequeueInputBuffer(long timeoutUs) {
@@ -221,13 +232,14 @@ public class ShadowMediaCodec {
       }
 
       if (index == null) {
-        return -1;
+        return MediaCodec.INFO_TRY_AGAIN_LATER;
       }
 
+      inputBuffersOwned[index] = false;
       return index;
     } catch (InterruptedException e) {
       Thread.currentThread().interrupt();
-      return -1;
+      return MediaCodec.INFO_TRY_AGAIN_LATER;
     }
   }
 
@@ -238,6 +250,11 @@ public class ShadowMediaCodec {
   @Implementation(minSdk = LOLLIPOP)
   protected void native_queueInputBuffer(
       int index, int offset, int size, long presentationTimeUs, int flags) {
+    if (index < 0 || index >= inputBuffers.length || inputBuffersOwned[index]) {
+      throwCodecException(
+          /* errorCode= */ 0, /* actionCode= */ 0, "Input buffer not owned by client: " + index);
+    }
+
     BufferInfo info = new BufferInfo();
     info.set(offset, size, presentationTimeUs, flags);
 
@@ -285,7 +302,10 @@ public class ShadowMediaCodec {
 
     if (isAsync) {
       // Signal input buffer availability.
+      inputBuffersOwned[index] = false;
       postFakeNativeEvent(EVENT_CALLBACK, CB_INPUT_AVAILABLE, index, null);
+    } else {
+      inputBuffersOwned[index] = true;
     }
   }
 
@@ -442,6 +462,20 @@ public class ShadowMediaCodec {
 
       /** Move the bytes on the in buffer to the out buffer */
       void process(ByteBuffer in, ByteBuffer out);
+    }
+  }
+
+  /** Reflectively throws a {@link CodecException}. */
+  private static void throwCodecException(int errorCode, int actionCode, String message) {
+    try {
+      Constructor<CodecException> constructor =
+          CodecException.class.getDeclaredConstructor(Integer.TYPE, Integer.TYPE, String.class);
+      throw constructor.newInstance(errorCode, actionCode, message);
+    } catch (NoSuchMethodException
+        | IllegalAccessException
+        | InstantiationException
+        | InvocationTargetException e) {
+      throw new RuntimeException(e);
     }
   }
 }
